@@ -1,1 +1,405 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <bluefruit.h>
+#include <nrf_gpio.h>
 
+// =====================================
+// 1. PIN CONFIGURATION
+// =====================================
+
+// LEDs: nRF52840 GPIO
+#define LED_RED NRF_GPIO_PIN_MAP(0, 13)
+#define LED_YELLOW NRF_GPIO_PIN_MAP(0, 14)
+#define LED_GREEN NRF_GPIO_PIN_MAP(0, 15)
+
+// Arduino pin numbers for Feather compile test
+// Change these for your custom PCB variant
+#define FLOW_PIN 2
+#define TEMP_PIN 3
+
+// OLED I2C
+#define OLED_SDA 6
+#define OLED_SCL 12
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 32
+#define OLED_ADDR 0x3C
+
+// =====================================
+// 2. SENSOR CONFIGURATION
+// =====================================
+
+// Flow sensor calibration
+// Example value for a YF-S201.
+// MUST calibrate with your actual sensor.
+#define FLOW_CALIBRATION 450.0
+
+// Temperature warning thresholds
+#define TEMP_WARM 40.0
+#define TEMP_HOT 50.0
+#define TEMP_DANGER 60.0
+
+// Hydration reminder
+#define REMINDER_INTERVAL 3600000UL
+#define MIN_DRINK_ML 20.0
+
+// =====================================
+// 3. OBJECTS
+// =====================================
+
+Adafruit_SSD1306 display(
+OLED_WIDTH,
+OLED_HEIGHT,
+&Wire,
+-1
+);
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature tempSensor(&oneWire);
+
+BLEUart bleuart;
+
+// =====================================
+// 4. GLOBAL VARIABLES
+// =====================================
+
+volatile unsigned long flowPulses = 0;
+
+float flowVolumeML = 0;
+float totalWaterML = 0;
+float temperatureC = 0;
+
+unsigned long lastFlowTime = 0;
+unsigned long lastTempTime = 0;
+unsigned long lastDisplayTime = 0;
+unsigned long lastReminderTime = 0;
+
+bool reminderActive = false;
+bool oledAvailable = false;
+
+// =====================================
+// 5. FLOW SENSOR INTERRUPT
+// =====================================
+
+void flowInterrupt() {
+flowPulses++;
+}
+
+// =====================================
+// 6. LED CONTROL
+// =====================================
+
+void allLEDsOff() {
+nrf_gpio_pin_clear(LED_RED);
+nrf_gpio_pin_clear(LED_YELLOW);
+nrf_gpio_pin_clear(LED_GREEN);
+}
+
+void updateLED(float waterLevel) {
+
+allLEDsOff();
+
+if (waterLevel <= 30) {
+nrf_gpio_pin_set(LED_RED);
+}
+else if (waterLevel <= 70) {
+nrf_gpio_pin_set(LED_YELLOW);
+}
+else {
+nrf_gpio_pin_set(LED_GREEN);
+}
+}
+
+// =====================================
+// 7. FLOW MEASUREMENT
+// =====================================
+
+void updateFlow() {
+
+unsigned long now = millis();
+
+if (now - lastFlowTime >= 1000) {
+
+noInterrupts();
+unsigned long pulses = flowPulses;
+flowPulses = 0;
+interrupts();
+
+// Convert pulses to mL
+flowVolumeML =
+  (pulses / FLOW_CALIBRATION) * 1000.0;
+
+if (flowVolumeML >= MIN_DRINK_ML) {
+  totalWaterML += flowVolumeML;
+
+  // Reset reminder after drinking
+  lastReminderTime = now;
+  reminderActive = false;
+}
+
+lastFlowTime = now;
+}
+}
+
+// =====================================
+// 8. TEMPERATURE MEASUREMENT
+// =====================================
+
+void updateTemperature() {
+
+unsigned long now = millis();
+
+if (now - lastTempTime >= 2000) {
+
+tempSensor.requestTemperatures();
+
+float reading =
+  tempSensor.getTempCByIndex(0);
+
+if (reading != DEVICE_DISCONNECTED_C &&
+    reading >= -20 && reading <= 100) {
+
+  temperatureC = reading;
+}
+
+lastTempTime = now;
+}
+}
+
+// =====================================
+// 9. TEMPERATURE WARNING
+// =====================================
+
+String getTemperatureStatus() {
+
+if (temperatureC >= TEMP_DANGER) {
+return "VERY HOT!";
+}
+
+if (temperatureC >= TEMP_HOT) {
+return "HOT";
+}
+
+if (temperatureC >= TEMP_WARM) {
+return "WARM";
+}
+
+return "NORMAL";
+}
+
+// =====================================
+// 10. HYDRATION REMINDER
+// =====================================
+
+void updateReminder() {
+
+unsigned long now = millis();
+
+if (now - lastReminderTime >=
+REMINDER_INTERVAL) {
+
+reminderActive = true;
+}
+}
+
+// =====================================
+// 11. OLED DISPLAY
+// =====================================
+
+void updateDisplay() {
+
+if (!oledAvailable) return;
+
+unsigned long now = millis();
+
+if (now - lastDisplayTime < 1000) {
+return;
+}
+
+lastDisplayTime = now;
+
+display.clearDisplay();
+display.setTextColor(SSD1306_WHITE);
+display.setTextSize(1);
+display.setCursor(0, 0);
+
+if (reminderActive) {
+
+display.println("TIME TO DRINK!");
+display.print("Total: ");
+display.print(totalWaterML, 0);
+display.println(" mL");
+}
+else if (temperatureC >= TEMP_HOT) {
+
+display.println("WARNING: HOT WATER");
+display.print("Temp: ");
+display.print(temperatureC, 1);
+display.println(" C");
+}
+else {
+
+display.println("SMART HYDRATION");
+
+display.print("Drank: ");
+display.print(totalWaterML, 0);
+display.println(" mL");
+
+display.print("Temp: ");
+display.print(temperatureC, 1);
+display.println(" C");
+
+display.print("Status: ");
+display.println(getTemperatureStatus());
+}
+
+display.display();
+}
+
+// =====================================
+// 12. BLE COMMUNICATION
+// =====================================
+
+void setupBLE() {
+
+Bluefruit.begin();
+
+Bluefruit.setName("SmartBottle");
+
+bleuart.begin();
+
+Bluefruit.Advertising.addFlags(
+BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE
+);
+
+Bluefruit.Advertising.addTxPower();
+
+Bluefruit.Advertising.addService(bleuart);
+
+Bluefruit.ScanResponse.addName();
+
+Bluefruit.Advertising.restartOnDisconnect(true);
+Bluefruit.Advertising.start(0);
+}
+
+void updateBLE() {
+
+if (Bluefruit.connected()) {
+
+static unsigned long lastBLETime = 0;
+
+if (millis() - lastBLETime >= 2000) {
+
+  lastBLETime = millis();
+
+  bleuart.print("Water:");
+  bleuart.print(totalWaterML, 0);
+  bleuart.print("mL,Temp:");
+  bleuart.print(temperatureC, 1);
+  bleuart.print("C,Reminder:");
+
+  bleuart.println(
+    reminderActive ? "YES" : "NO"
+  );
+}
+}
+}
+
+// =====================================
+// 13. SETUP
+// =====================================
+
+void setup() {
+
+Serial.begin(115200);
+
+// Configure LEDs
+nrf_gpio_cfg_output(LED_RED);
+nrf_gpio_cfg_output(LED_YELLOW);
+nrf_gpio_cfg_output(LED_GREEN);
+
+allLEDsOff();
+
+// Configure flow sensor
+pinMode(FLOW_PIN, INPUT_PULLUP);
+
+attachInterrupt(
+digitalPinToInterrupt(FLOW_PIN),
+flowInterrupt,
+RISING
+);
+
+// Configure temperature sensor
+tempSensor.begin();
+
+// Configure OLED
+Wire.setPins(OLED_SDA, OLED_SCL);
+Wire.begin();
+Wire.setClock(100000);
+
+oledAvailable = display.begin(
+SSD1306_SWITCHCAPVCC,
+OLED_ADDR
+);
+
+if (oledAvailable) {
+display.clearDisplay();
+display.display();
+}
+
+// Initialize BLE
+setupBLE();
+
+// Initialize timers
+lastFlowTime = millis();
+lastTempTime = millis();
+lastDisplayTime = millis();
+lastReminderTime = millis();
+
+Serial.println("SMART BOTTLE STARTED");
+}
+
+// =====================================
+// 14. MAIN LOOP
+// =====================================
+
+void loop() {
+
+updateFlow();
+
+updateTemperature();
+
+updateReminder();
+
+// Example LED indication based on
+// estimated remaining water percentage.
+// Replace with actual water-level sensor data.
+static float waterLevelPercent = 75;
+
+updateLED(waterLevelPercent);
+
+updateDisplay();
+
+updateBLE();
+
+// Serial monitoring
+static unsigned long lastSerialTime = 0;
+
+if (millis() - lastSerialTime >= 2000) {
+
+lastSerialTime = millis();
+
+Serial.print("Drinking: ");
+Serial.print(totalWaterML);
+Serial.println(" mL");
+
+Serial.print("Temperature: ");
+Serial.println(temperatureC);
+
+Serial.print("Reminder: ");
+Serial.println(reminderActive ? "YES" : "NO");
+}
+}
